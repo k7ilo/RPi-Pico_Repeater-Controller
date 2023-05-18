@@ -1,0 +1,650 @@
+/* 
+K7ILO Notes:
+This code was originally found here: https://www.reddit.com/r/amateurradio/comments/o1mnn1/question_how_to_build_arduino_based_repeater/
+It has been and will be heavilly modified for use on the Raspberry Pi Pico with added features by me, Harold Kinchelow K7ILO, 
+started on 4/24/2023 and will continue until satisfied with the results...
+
+As requested by, who states to be, the original author, I am attaching his Copyright.  It will also be included on the work that i continue
+with.
+
+repeater_controller_basic_05 (k7ilo: actually repeater_controller_basic_06 based on file name downloaded)
+
+By Bill Chaikin KA8VIT
+
+Copyright (c) 2015-2017 Bill Chaikin KA8VIT - All Rights Reserved.
+Free for public use if original copyright notice included.
+*/
+
+
+
+#define HIGH_BEEP 1500         // freq high beep Hertz
+#define LOW_BEEP 400           // freq low beep Hertz
+#define CW_PITCH 600
+
+// repeater states
+#define R_IDLE 0
+#define R_TRANSMITTING 1
+#define R_TIMEOUT 2
+#define R_HANGTIME 3
+
+
+//////////////////////////////////
+// Morse Code translation Table //
+//////////////////////////////////
+
+// Morse code characters are bit encoded from left to right.
+// The first one bit is a flag to mark the start of the character's elements.
+// The following bits represent the elements of the Morse character with
+// one bits being dashes (dahs) and zero bits being dots (dits).
+//
+// The table is stored in flash/program memory.
+
+const byte morse_table[] PROGMEM = {
+  'A', 0B00000101,
+  'B', 0B00011000,
+  'C', 0B00011010,
+  'D', 0B00001100,
+  'E', 0B00000010,
+  'F', 0B00010010,
+  'G', 0B00001110,
+  'H', 0B00010000,
+  'I', 0B00000100,
+  'J', 0B00010111,
+  'K', 0B00001101,
+  'L', 0B00010100,
+  'M', 0B00000111,
+  'N', 0B00000110,
+  'O', 0B00001111,
+  'P', 0B00010110,
+  'Q', 0B00011101,
+  'R', 0B00001010,
+  'S', 0B00001000,
+  'T', 0B00000011,
+  'U', 0B00001001,
+  'V', 0B00010001,
+  'W', 0B00001011,
+  'X', 0B00011001,
+  'Y', 0B00011011,
+  'Z', 0B00011100,
+
+  '0', 0B00111111,
+  '1', 0B00101111,
+  '2', 0B00100111,
+  '3', 0B00100011,
+  '4', 0B00100001,
+  '5', 0B00100000,
+  '6', 0B00110000,
+  '7', 0B00111000,
+  '8', 0B00111100,
+  '9', 0B00111110,
+
+  '#', 0B11000101,  // /BK
+  '+', 0B00101010,  // /AR
+  ',', 0B01110011,
+  '-', 0B01100001,
+  '.', 0B01010101,
+  '/', 0B00110010,
+  '=', 0B00110001,
+  '?', 0B01001100,
+  '^', 0B01000101,  // /SK
+
+  0xff  // end-of-table marker
+};
+
+
+/////////////////////////////////////////////////////
+///           USER SPECIFIC STUFF                 ///
+/////////////////////////////////////////////////////
+
+// the message strings below are stored in flash/program memory.
+
+const unsigned char id_message[] PROGMEM = "DE KA8VIT/R";
+
+const unsigned char info_message[] PROGMEM = "PUT SOMETHING HERE +";
+
+
+int speakerPin = 11;  // Keyed CW audio (5V signal)
+
+int pttLine = 8;      // PPT Line - This is what keys transmitter
+// LOW = unkeyed/xmitter off   HIGH = keyed/xmitter on
+
+int carDetectInd = 7;  // carrier detected indicator
+// LOW (off) = No carrier signal detected  HIGH (on) = Carrier Detected
+
+int transTimeOutInd = 6;  // transmitter time-out indicator
+// LOW (off) = normal   HIGH (on) = transmitter timeout period occurring
+
+int hangTimeInd = 5;  // hang time indicator
+// LOW (off) = not in hang time wait state   HIGH (on) = currently in hang time wait state
+
+int heartBeatLED = 4;  // this is just a heartbeat LED.  It lets us know our loop is running.  this is handy
+// when in or near RF environment which can cause microprocessors to lock up.
+
+int corSignal = 9;    // Carrier present signal pin (input)
+// LOW = Carrier Present   HIGH = No Carrier
+
+
+unsigned long heartBeatPeriod = 100;      // number of millis of heartbeat flash
+unsigned long corDebounceInterval = 250;  // number of millis before cor signal is recognized
+unsigned long pttTimeoutTime = 90000;     // how long before PTT line is timed out (inhibited)
+unsigned long pttTimeoutPeriod = 5000;    // how long to stay inactive after timing out
+unsigned long hangTimePeriod = 3000;      // how long to hang after COR is lost
+unsigned long IDintervalActive = 510000;  // ID interval
+unsigned long IDnow = 540000;             // ID now
+
+int morse_speed = 20;                     // Speed in WPM
+
+/////////////////////////////////////////////////////
+///         END OF USER SPECIFIC STUFF            ///
+/////////////////////////////////////////////////////
+
+
+unsigned long curLoopTime = 0;          // millis at top of current loop
+unsigned long heartBeatLast = 0;        // millis of last heartbeat
+unsigned long corSigLastDebounce = 0;   // millis of last cor signal debounce;
+unsigned long curTransTime = 0;         // number of millis PTT line has been on
+unsigned long pttTimeoutStart = 0;      // millis when timeout started
+unsigned long hangTimeStart = 0;        // millis hang time period stated
+unsigned long lastIDactive = 0;         // millis of last ID
+
+unsigned long timeOfLastTransmit = 0;   // millis of last transmitter unkey
+
+bool heartBeatState = LOW;
+bool transInhibit = false;  // inhitbit the transmitter
+bool corFirst = true;
+bool IDFlag = false;
+
+int controllerState = R_IDLE;
+int ele_len = ((1.2 / morse_speed) * 1000);
+
+byte char2send = 0;
+
+
+void setup() {
+  // set up our pins as outputs and inputs
+  pinMode(heartBeatLED, OUTPUT);
+  pinMode(hangTimeInd, OUTPUT);
+  pinMode(transTimeOutInd, OUTPUT);
+  pinMode(carDetectInd, OUTPUT);
+  pinMode(pttLine, OUTPUT);
+  pinMode(speakerPin, OUTPUT);
+
+  pinMode(corSignal, INPUT_PULLUP);
+
+  // flash all the LEDs to let us know the wiring hasn't come loose.
+  LedTest();
+
+  // make sure speaker is working - no loose wires.
+  SpeakerTest();
+
+  // default our output states
+  digitalWrite(heartBeatLED, LOW);
+  digitalWrite(hangTimeInd, LOW);
+  digitalWrite(transTimeOutInd, LOW);
+  digitalWrite(carDetectInd, LOW);
+  digitalWrite(pttLine, LOW);
+
+  timeOfLastTransmit = 0;
+  lastIDactive = 0;
+  IDFlag = false;
+  
+  corFirst = true;
+  controllerState = R_IDLE;
+}
+
+// our main loop - handles the various states (modes) of our
+// repeater controller
+
+void loop()
+{
+  curLoopTime = millis();
+
+  // flashes the heartbeat LED
+  Heartbeat();
+
+  // check if it is time to ID
+  checkIDTime();
+
+  // here the different repeater controller states (modes) are handled
+  switch (controllerState)
+  {
+    case R_IDLE:  // idle - waiting for a carrier handler
+      checkCOR();
+      break;
+
+    case R_TRANSMITTING:  // transmitting handler
+      check4Timeout();
+      break;
+
+    case R_TIMEOUT:
+      waitTimeoutPeriod();  // transmit time-out handler
+      break;
+
+    case R_HANGTIME:
+      waitHangTimePeriod();  // hang time handler
+      break;
+
+    default:
+      break;
+  }
+}
+
+
+void checkIDTime()
+{
+  if ((millis() - lastIDactive) < IDintervalActive)
+  {
+    return;
+  }
+
+  if (controllerState == R_IDLE)
+  {
+    send_cw_id();
+    beep_boop();
+
+    hangTimeStart = millis();
+    controllerState = R_HANGTIME;
+    digitalWrite(hangTimeInd, HIGH);      
+  }
+  else
+  {
+    if ((millis() - lastIDactive) < IDnow)
+    {
+      IDFlag = true;
+      return;
+    }  
+
+    send_cw_id();
+    controllerState = R_TRANSMITTING;
+  }
+}
+
+void send_cw_id()
+{
+  IDFlag = false;
+  digitalWrite(heartBeatLED, LOW);
+  digitalWrite(pttLine, HIGH);
+  delay(300);
+  send_morse_msg(id_message);
+  delay(300);
+  lastIDactive = millis();
+}
+
+void courtesy_tone()
+{
+  delay(150);
+  tone(speakerPin, HIGH_BEEP);
+  delay(100);
+  noTone(speakerPin);
+}
+
+void beep_boop()
+{
+  delay(150);
+  tone(speakerPin, HIGH_BEEP);
+  delay(100);
+  tone(speakerPin, LOW_BEEP);
+  delay(100);
+  noTone(speakerPin);
+}
+
+
+void boop_beep()
+{
+  delay(150);
+  tone(speakerPin, LOW_BEEP);
+  delay(100);
+  tone(speakerPin, HIGH_BEEP);
+  delay(100);
+  noTone(speakerPin);
+}
+
+
+void send_dit()
+{
+  tone(speakerPin, CW_PITCH);
+  delay(ele_len);
+  noTone(speakerPin);
+  delay(ele_len);
+}
+
+
+void send_dah()
+{
+  tone(speakerPin, CW_PITCH);
+  delay(ele_len * 3);
+  noTone(speakerPin);
+  delay(ele_len);
+}
+
+
+void send_morse_char(byte c)
+{
+  byte bp = 0;
+  byte ditordah = 0;
+  bool first = false;
+  unsigned int j = 0;
+
+  switch (c)
+  {
+    case ' ':
+      delay(ele_len * 7);
+      break;
+
+    case 8:
+    case 127:
+      break;
+
+    default:
+    // while bp is not our end of table flag
+      while (bp != 0xff)
+      {
+        // we should be pointing as an alpha/digit/puncutation character in our table
+        bp = pgm_read_byte_near(morse_table + j);
+
+        // have we reached the end of our table ?
+        if (bp != 0xff)
+        {
+          // is the chacater we're pointing to in the Morse table the same as the
+          // character we want to send ?
+          if (bp == c)
+          {
+            // yes - so bump our pointer to the Morse code chacter bit pattern for
+            // the chacater we want to send
+            j++;
+
+            // now get the bit pattern into bp
+            bp = pgm_read_byte_near(morse_table + j);
+
+            // start processing the bit pattern
+            for (int i = 0; i < 8; i++)
+            {
+              // get the high bit of the pattern into our ditordah variable
+              ditordah = (bp & 128);
+
+              // have we found our start flag yet ?
+              if (first == false)
+              {
+                // if no, is it our start flag
+                if (ditordah != 0)
+                {
+                  // yes - set our flag
+                  first = true;
+                }
+
+                // now shift the bit pattern one bit to the left and continue
+                bp = (bp << 1);
+                continue;
+              }
+
+              // if we've seen our start flag then send the dash or dot based on the bit
+              if (ditordah != 0)
+              {
+                send_dah();
+              }
+              else
+              {
+                send_dit();
+              }
+
+              // now shift the bit pattern one bit to the left and continue
+              bp = (bp << 1);
+            }
+
+            // there is a three element delay between chacaters.  the send_dash() or
+            // send_dot() functions already add a one element delay so we delay
+            // two more element times.
+            delay(ele_len * 2);
+            return;
+          }
+        }
+
+        j++;
+        j++;
+      }
+
+      break;
+  }
+}
+
+
+// sends the string stored in PROGMEM in Morse code on
+// the speakerPin
+
+void send_morse_msg(const unsigned char* msg_adr)
+{
+  unsigned int p = 0;
+
+  while (true)
+  {
+    char2send = pgm_read_byte_near(msg_adr + p++);
+
+    if (char2send == 0)
+    {
+      return;
+    }
+
+    send_morse_char(char2send);
+  }
+}
+
+
+// handles the hang time condition. if a COR signal is detected during the
+// hang time, set our transmit start time, turn on the COR signal indicator LED,
+// turn on the PTT line and set the repeater controller state to 1, waiting for
+// time-out.
+
+void waitHangTimePeriod()
+{
+  if (digitalRead(corSignal) == LOW)
+  {
+    curTransTime = millis();
+    digitalWrite(carDetectInd, HIGH);
+    digitalWrite(hangTimeInd, LOW);
+
+    if (transInhibit == false)
+    {
+      digitalWrite(pttLine, HIGH);
+    }
+
+    controllerState = R_TRANSMITTING;
+  }
+  else
+  {
+    if ((millis() - hangTimeStart) < hangTimePeriod)
+    {
+      return;
+    }
+
+    digitalWrite(pttLine, LOW);
+    digitalWrite(hangTimeInd, LOW);
+
+    corSigLastDebounce = millis();
+    corFirst = true;
+    controllerState = R_IDLE;
+  }
+}
+
+// handles the time-out condition.  Toggle the carrier detect LED as needed
+// during the time-out period. If out time-out interval has not past, just return,
+// otherwise turn off the time-out indicator LED, clear the transmit inhibit flag
+// and set the repeater controller mode to 0, waiting for a carrier.
+
+void waitTimeoutPeriod()
+{
+  if (digitalRead(corSignal) == LOW)
+  {
+    digitalWrite(carDetectInd, HIGH);
+    return;
+  }
+  
+  if (digitalRead(corSignal) == HIGH)
+  {
+    digitalWrite(carDetectInd, LOW);
+  }
+  else
+  {
+    digitalWrite(carDetectInd, HIGH);
+  }
+
+  if ((millis() - pttTimeoutStart) < pttTimeoutPeriod)
+  {
+    return;
+  }
+
+  digitalWrite(transTimeOutInd, LOW);
+  transInhibit = false;
+
+  digitalWrite(pttLine, HIGH);
+  delay(300);
+  boop_beep();
+  delay(300);
+  digitalWrite(pttLine, LOW);
+
+  corSigLastDebounce = millis();
+  timeOfLastTransmit = millis();
+  corFirst = true;
+  controllerState = R_IDLE;
+}
+
+// this occurs while we are transmitting. if we still have a COR signal and
+// we have been transmitting less then out timeout time period, just return.
+//
+// If we are past our time-out time peroid, set out time-out start time,
+// set our transmit inhibit flag, turn on our time-out indicator LED, and
+// turn off the PTT line (LED).
+//
+// If the COR signal has dropped, set our hang time start time, turn off
+// the time-out period indicator LED and turn off the carrier detect LED
+// and set the repeater controller state (mode) to 3, the hang time handler.
+
+void check4Timeout()
+{
+  if (digitalRead(corSignal) == LOW)
+  {
+    if ((millis() - curTransTime) < pttTimeoutTime)
+    {
+      return;
+    }
+
+    beep_boop();
+    delay(300);
+    pttTimeoutStart = millis();
+    transInhibit = true;
+    digitalWrite(transTimeOutInd, HIGH);
+    digitalWrite(pttLine, LOW);
+
+    controllerState = R_TIMEOUT;
+  }
+  else
+  {
+    digitalWrite(carDetectInd, LOW);
+    courtesy_tone();
+
+    if (lastIDactive == 0 || IDFlag == true)
+    {
+      delay(500);
+      send_cw_id();
+    }
+    else
+    {
+      hangTimeStart = millis();
+      digitalWrite(transTimeOutInd, LOW);
+      digitalWrite(hangTimeInd, HIGH);
+      controllerState = R_HANGTIME;      
+    }
+  }
+}
+
+// wait for a COR (carrier detect) signal to go low indicating a carrier is recieved
+// COR signal must be present for corDebounceInterval ms to be valid, otherwise it is
+// ignored (debouncing).
+//
+// once we have a valid COR signal reset debounce time, turn on carrier detect LED,
+// and if transmit if not inhibited, turn on the PTT Line (LED), and then set the
+// repeater controller state (mode) to 1, transmitting.
+void checkCOR()
+{
+  if (digitalRead(corSignal) == LOW)
+  {
+    if (corFirst == true)
+    {
+      corSigLastDebounce = millis();
+      corFirst = false;
+
+      return;
+    }
+
+    if ((millis() - corSigLastDebounce) < corDebounceInterval)
+    {
+      return;
+    }
+
+    corSigLastDebounce = 0;
+    digitalWrite(carDetectInd, HIGH);
+
+    if (transInhibit == false)
+    {
+      curTransTime = millis();
+      digitalWrite(pttLine, HIGH);
+
+      controllerState = R_TRANSMITTING;
+    }
+  }
+  else
+  {
+    corFirst = true;
+  }
+}
+
+// toggle the heartbeart LED every heartBeatPeriod number of ms.
+// except when sending CW or beeps.
+void Heartbeat()
+{
+  if ((millis() - heartBeatLast) < heartBeatPeriod)
+  {
+    return;
+  }
+
+  heartBeatLast += heartBeatPeriod;
+  heartBeatState = !heartBeatState;
+
+  digitalWrite(heartBeatLED, heartBeatState);
+}
+
+// flash the LEDs 20-times to make sure the all lights up - no loose wires.
+void LedTest()
+{
+  for (int i = 0; i < 20; i++)
+  {
+    digitalWrite(heartBeatLED, HIGH);
+    digitalWrite(hangTimeInd, HIGH);
+    digitalWrite(transTimeOutInd, HIGH);
+    digitalWrite(carDetectInd, HIGH);
+    digitalWrite(pttLine, HIGH);
+
+    delay(40);
+
+    digitalWrite(heartBeatLED, LOW);
+    digitalWrite(hangTimeInd, LOW);
+    digitalWrite(transTimeOutInd, LOW);
+    digitalWrite(carDetectInd, LOW);
+    digitalWrite(pttLine, LOW);
+
+    delay(40);
+  }
+}
+
+void SpeakerTest()
+{
+  for (unsigned int i = 300; i < 1500; i += 50)
+  {
+    tone(speakerPin, i);
+    delay(20);
+  }
+
+  delay(300);
+  noTone(speakerPin);
+}
+
+
